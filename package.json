@@ -1,0 +1,29 @@
+{
+  "name": "sunwin-taixiu-vip-pro",
+  "version": "2.0.0",
+  "description": "WebSocket Tài Xỉu Sunwin VIP PRO MAX - Realtime + Anti Ban + Auto Reconnect",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "sunwin",
+    "taixiu",
+    "websocket",
+    "vip",
+    "realtime"
+  ],
+  "author": "ADMIN VAN MINH VIP",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.14.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.7",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
