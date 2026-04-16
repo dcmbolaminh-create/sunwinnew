@@ -1,292 +1,217 @@
-const Fastify = require("fastify");
-const WebSocket = require("ws");
-const fs = require("fs");
-const path = require("path");
+const express = require("express");
+const axios = require("axios");
+const cors = require("cors");
 
-const fastify = Fastify({ logger: false });
-const PORT = process.env.PORT || 3001;
-const HISTORY_FILE = path.join(__dirname, 'taixiu_history.json');
+const app = express();
+app.use(cors());
+app.set("json spaces", 2);
 
-let rikResults = [];
-let rikCurrentSession = null;
-let rikWS = null;
-let rikIntervalCmd = null;
-let reconnectTimeout = null;
-let isAuthenticated = false;
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 10;
+const PORT = process.env.PORT || 3000;
 
-// Load lịch sử
-function loadHistory() {
-    try {
-        if (fs.existsSync(HISTORY_FILE)) {
-            rikResults = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
-            console.log(`📚 Loaded ${rikResults.length} history records`);
-        }
-    } catch (err) {
-        console.error('Error loading history:', err);
+// ===== CONFIG =====
+const API_URL = "https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau";
+const ADMIN = "@vanminh2603";
+
+// ===== CACHE =====
+let cache = null;
+let lastFetch = 0;
+let lastSessionId = null;
+const FETCH_INTERVAL = 30000;
+
+// ===== HELPER =====
+const getTaiXiu = v => (v >= 11 ? "TÀI" : "XỈU");
+
+// ===== MARKOV =====
+function markovPredict(arr) {
+  if (!arr || arr.length < 3)
+    return { predict: "ĐANG PHÂN TÍCH", confidence: "0%" };
+
+  let map = {};
+
+  for (let i = 0; i < arr.length - 1; i++) {
+    let a = arr[i];
+    let b = arr[i + 1];
+    if (!map[a]) map[a] = {};
+    map[a][b] = (map[a][b] || 0) + 1;
+  }
+
+  let last = arr[arr.length - 1];
+  let next = map[last] || {};
+
+  let total = Object.values(next).reduce((a, b) => a + b, 0);
+  let best = "ĐANG PHÂN TÍCH";
+  let max = 0;
+
+  for (let k in next) {
+    if (next[k] > max) {
+      max = next[k];
+      best = k;
     }
+  }
+
+  return {
+    predict: best,
+    confidence: total ? ((max / total) * 100).toFixed(2) + "%" : "0%"
+  };
 }
 
-// Lưu lịch sử
-function saveHistory() {
-    try {
-        fs.writeFileSync(HISTORY_FILE, JSON.stringify(rikResults), 'utf8');
-    } catch (err) {
-        console.error('Error saving history:', err);
+// ===== PATTERN =====
+function analyzePattern(results) {
+  let tx = results.map(getTaiXiu);
+
+  let pattern = { type: "NONE", streak: 0 };
+
+  if (tx.length < 3) return { tx, pattern };
+
+  let last = tx[tx.length - 1];
+  let streak = 1;
+
+  for (let i = tx.length - 2; i >= 0; i--) {
+    if (tx[i] === last) streak++;
+    else break;
+  }
+
+  if (streak >= 3) pattern = { type: "CẦU BỆT", streak };
+
+  let last3 = tx.slice(-3).join("-");
+  if (last3 === "TÀI-TÀI-XỈU" || last3 === "XỈU-XỈU-TÀI") {
+    pattern = { type: "CẦU 2-1", streak: 3 };
+  }
+
+  return { tx, pattern };
+}
+
+// ===== AI =====
+function evaluate(pattern, markov) {
+  let score = 0;
+
+  if (pattern.type !== "NONE") score += 40;
+  if (pattern.streak >= 3) score += 30;
+  if (markov.confidence !== "0%") score += 30;
+
+  if (score >= 80) return "🔥 TỶ LỆ CAO";
+  if (score >= 50) return "⚠️ CÂN NHẮC";
+  return "❌ RỦI RO";
+}
+
+// ===== FETCH =====
+async function fetchData() {
+  const now = Date.now();
+  if (cache && now - lastFetch < FETCH_INTERVAL) return cache;
+
+  try {
+    const res = await axios.get(API_URL, { timeout: 10000 });
+    let data = res.data;
+
+    // ===== AUTO FIX FORMAT =====
+    let list = [];
+    if (Array.isArray(data)) list = data;
+    else if (Array.isArray(data?.data)) list = data.data;
+    else if (Array.isArray(data?.result)) list = data.result;
+    else if (Array.isArray(data?.items)) list = data.items;
+
+    if (!list.length && cache) return cache;
+
+    if (!list.length) {
+      return {
+        admin: ADMIN,
+        error: "API CHƯA CÓ DỮ LIỆU",
+        time: new Date().toLocaleString("vi-VN")
+      };
     }
-}
 
-// Xác định Tài/Xỉu
-function getTX(d1, d2, d3) {
-    return d1 + d2 + d3 >= 11 ? "T" : "X";
-}
+    const latest = list[0];
 
-// Gửi lệnh định kỳ - ĐÃ NÂNG CẤP
-function sendPeriodicCommands() {
-    if (rikWS?.readyState === WebSocket.OPEN && isAuthenticated) {
-        try {
-            // Lệnh 1005 để lấy lịch sử - QUAN TRỌNG
-            const cmd1005 = [
-                6,
-                "MiniGame",
-                "taixiuPlugin",
-                {
-                    "cmd": 1005,
-                    "sid": rikCurrentSession || 0
-                }
-            ];
-            rikWS.send(JSON.stringify(cmd1005));
-            
-            // Lệnh 10001 để giữ kết nối
-            const cmd10001 = [
-                6,
-                "MiniGame", 
-                "lobbyPlugin",
-                {
-                    "cmd": 10001
-                }
-            ];
-            rikWS.send(JSON.stringify(cmd10001));
-            
-            // Thêm lệnh 1003 để lấy kết quả hiện tại
-            const cmd1003 = [
-                6,
-                "MiniGame",
-                "taixiuPlugin", 
-                {
-                    "cmd": 1003
-                }
-            ];
-            rikWS.send(JSON.stringify(cmd1003));
-            
-            console.log("📤 Sent periodic commands: 1005, 10001, 1003");
-        } catch (err) {
-            console.error("Error sending commands:", err);
-        }
-    }
-}
+    const session =
+      latest.sessionId ||
+      latest.SessionId ||
+      latest.id ||
+      Date.now();
 
-// Ping để giữ kết nối
-function sendPing() {
-    if (rikWS?.readyState === WebSocket.OPEN) {
-        try {
-            rikWS.ping();
-        } catch (err) {
-            console.error("Ping error:", err);
-        }
-    }
-}
+    if (session === lastSessionId) return cache;
 
-// Kết nối WebSocket với token thật - ĐÃ NÂNG CẤP
-function connectWebSocket() {
-    console.log(`🔌 Connecting to WebSocket... Attempt ${reconnectAttempts + 1}`);
-    
-    try {
-        // Clear existing connection
-        if (rikWS) {
-            rikWS.removeAllListeners();
-            if (rikWS.readyState === WebSocket.OPEN) {
-                rikWS.close();
-            }
-        }
+    lastSessionId = session;
+    lastFetch = now;
 
-        rikWS = new WebSocket("wss://websocket.gmwin.io/websocket?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJnZW5kZXIiOjAsImNhblZpZXdTdGF0IjpmYWxzZSwiZGlzcGxheU5hbWUiOiJnZW13aW4xMjMiLCJib3QiOjAsImlzTWVyY2hhbnQiOmZhbHNlLCJ2ZXJpZmllZEJhbmtBY2NvdW50IjpmYWxzZSwicGxheUV2ZW50TG9iYnkiOmZhbHNlLCJjdXN0b21lcklkIjozMTc3ODQwNDAsImFmZklkIjoiR0VNV0lOIiwiYmFubmVkIjpmYWxzZSwiYnJhbmQiOiJnZW0iLCJ0aW1lc3RhbXAiOjE3NTg4OTg5NDU5NjIsImxvY2tHYW1lcyI6W10sImFtb3VudCI6MCwibG9ja0NoYXQiOmZhbHNlLCJwaG9uZVZlcmlmaWVkIjpmYWxzZSwiaXBBZGRyZXNzIjoiMjQwMjo4MDA6NjM3ODo2MzNhOjg5OGQ6MWM1Yzo5OTYxOmVjMTQiLCJtdXRlIjpmYWxzZSwiYXZhdGFyIjoiaHR0cHM6Ly9pbWFnZXMuc3dpbnNob3AubmV0L2ltYWdlcy9hdmF0YXIvYXZhdGFyXzE3LnBuZyIsInBsYXRmb3JtSWQiOjUsInVzZXJJZCI6IjJhOWYxNWViLTYzYWYtNDM5YS05ZjJmLTQwYjUyZTVhOWMxZiIsInJlZ1RpbWUiOjE3NTgyOTQzMjY3MDIsInBob25lIjoiIiwiZGVwb3NpdCI6ZmFsc2UsInVzZXJuYW1lIjoiR01feGluYXBpc3VuIn0.BYc0EQLTALiFzSm-eJj37A5YWGsYhXyzj5ayV49XIQE", {
-            handshakeTimeout: 10000,
-            perMessageDeflate: false
-        });
+    // ===== MAP =====
+    const results = list
+      .map(x => Number(x.total || x.DiceSum || x.sum))
+      .filter(x => !isNaN(x));
 
-        rikWS.on('open', () => {
-            console.log("✅ WebSocket connected");
-            clearTimeout(reconnectTimeout);
-            reconnectAttempts = 0;
-            isAuthenticated = false;
-            
-            // Gửi xác thực
-            const authPayload = [
-                1,
-                "MiniGame",
-                "GM_xinapisun",
-                "123321",
-                {
-                    "info": "{\"ipAddress\":\"2402:800:6378:633a:898d:1c5c:9961:ec14\",\"wsToken\":\"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJnZW5kZXIiOjAsImNhblZpZXdTdGF0IjpmYWxzZSwiZGlzcGxheU5hbWUiOiJnZW13aW4xMjMiLCJib3QiOjAsImlzTWVyY2hhbnQiOmZhbHNlLCJ2ZXJpZmllZEJhbmtBY2NvdW50IjpmYWxzZSwicGxheUV2ZW50TG9iYnkiOmZhbHNlLCJjdXN0b21lcklkIjozMTc3ODQwNDAsImFmZklkIjoiR0VNV0lOIiwiYmFubmVkIjpmYWxzZSwiYnJhbmQiOiJnZW0iLCJ0aW1lc3RhbXAiOjE3NTg4OTg5NDU5NjIsImxvY2tHYW1lcyI6W10sImFtb3VudCI6MCwibG9ja0NoYXQiOmZhbHNlLCJwaG9uZVZlcmlmaWVkIjpmYWxzZSwiaXBBZGRyZXNzIjoiMjQwMjo4MDA6NjM3ODo2MzNhOjg5OGQ6MWM1Yzo5OTYxOmVjMTQiLCJtdXRlIjpmYWxzZSwiYXZhdGFyIjoiaHR0cHM6Ly9pbWFnZXMuc3dpbnNob3AubmV0L2ltYWdlcy9hdmF0YXIvYXZhdGFyXzE3LnBuZyIsInBsYXRmb3JtSWQiOjUsInVzZXJJZCI6IjJhOWYxNWViLTYzYWYtNDM5YS05ZjJmLTQwYjUyZTVhOWMxZiIsInJlZ1RpbWUiOjE3NTgyOTQzMjY3MDIsInBob25lIjoiIiwiZGVwb3NpdCI6ZmFsc2UsInVzZXJuYW1lIjoiR01feGluYXBpc3VuIn0.BYc0EQLTALiFzSm-eJj37A5YWGsYhXyzj5ayV49XIQE\",\"locale\":\"vi\",\"userId\":\"2a9f15eb-63af-439a-9f2f-40b52e5a9c1f\",\"username\":\"GM_xinapisun\",\"timestamp\":1758898945962,\"refreshToken\":\"233962e18a194ccc9615cfebf0029766.9a095fdf28814993ae22642137158144\"}",
-                    "signature": "1224E282F8E651385CD6073CC31B502E6CF18BE0073E508E8116F975BCA732D2B88E2F4A891A05608F7C81768EA87F0C0CF644410D27305DCCFD84716666EF3429A5140C48B9152C9A0BACC0696A7CC5C5E2AE6F6A085FDC7F5031819583C1177C13CC47E83D5AE49585430E459B7FDF30DAFE0F94EC3EF7FE9CC9720D39188C"
-                }
-            ];
-            
-            rikWS.send(JSON.stringify(authPayload));
-            console.log("🔐 Sent authentication");
-        });
+    const analysis = analyzePattern(results);
+    const markov = markovPredict(analysis.tx);
 
-        rikWS.on('message', (data) => {
-            try {
-                const json = JSON.parse(data.toString());
-                console.log("📨 Received:", JSON.stringify(json).substring(0, 200) + "...");
-                
-                // Xử lý xác thực thành công
-                if (Array.isArray(json) && json[0] === 1 && json[1] === true) {
-                    isAuthenticated = true;
-                    console.log("✅ Authentication successful");
-                    
-                    // Bắt đầu gửi lệnh định kỳ
-                    clearInterval(rikIntervalCmd);
-                    rikIntervalCmd = setInterval(sendPeriodicCommands, 3000); // Giảm thời gian xuống 3s
-                    
-                    // Bắt đầu ping định kỳ
-                    setInterval(sendPing, 30000); // Ping mỗi 30s
-                    
-                    // Gửi ngay lần đầu
-                    setTimeout(sendPeriodicCommands, 500);
-                    return;
-                }
-                
-                // Xử lý lấy mã phiên từ cmd 1008
-                if (Array.isArray(json) && json[1]?.cmd === 1008 && json[1]?.sid) {
-                    const sid = json[1].sid;
-                    if (!rikCurrentSession || sid > rikCurrentSession) {
-                        rikCurrentSession = sid;
-                        console.log(`📋 Phiên hiện tại: ${sid}`);
-                    }
-                    return;
-                }
-                
-                // Xử lý kết quả từ cmd 1003 và 1004
-                if (Array.isArray(json) && (json[1]?.cmd === 1003 || json[1]?.cmd === 1004) && 
-                    json[1]?.d1 !== undefined && json[1]?.d2 !== undefined && json[1]?.d3 !== undefined) {
-                    
-                    const res = json[1];
-                    if (rikCurrentSession && (!rikResults[0] || rikResults[0].sid !== rikCurrentSession)) {
-                        rikResults.unshift({ 
-                            sid: rikCurrentSession, 
-                            d1: res.d1, 
-                            d2: res.d2, 
-                            d3: res.d3, 
-                            timestamp: Date.now() 
-                        });
-                        if (rikResults.length > 100) rikResults.pop();
-                        saveHistory();
-                        console.log(`🎲 Phiên ${rikCurrentSession} → ${getTX(res.d1, res.d2, res.d3)} (${res.d1},${res.d2},${res.d3})`);
-                    }
-                    return;
-                }
-                
-                // Xử lý lịch sử từ cmd 1005
-                if (Array.isArray(json) && json[1]?.cmd === 1005 && json[1]?.htr) {
-                    const newHistory = json[1].htr.map(i => ({
-                        sid: i.sid, 
-                        d1: i.d1, 
-                        d2: i.d2, 
-                        d3: i.d3, 
-                        timestamp: Date.now()
-                    })).sort((a, b) => b.sid - a.sid);
-                    
-                    if (newHistory.length > 0) {
-                        rikResults = newHistory.slice(0, 100);
-                        saveHistory();
-                        console.log(`📦 Loaded ${newHistory.length} history records`);
-                    }
-                    return;
-                }
-                
-            } catch (e) {
-                console.error("Parse error:", e.message);
-            }
-        });
+    // ===== DATA =====
+    const x1 = latest.FirstDice || latest.firstDice || 0;
+    const x2 = latest.SecondDice || latest.secondDice || 0;
+    const x3 = latest.ThirdDice || latest.thirdDice || 0;
 
-        rikWS.on('close', (code, reason) => {
-            console.log(`🔌 WebSocket closed: ${code} - ${reason}`);
-            isAuthenticated = false;
-            clearInterval(rikIntervalCmd);
-            
-            // Exponential backoff cho reconnect
-            reconnectAttempts++;
-            const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-            console.log(`Reconnecting in ${delay}ms...`);
-            
-            reconnectTimeout = setTimeout(connectWebSocket, delay);
-        });
+    const sum = latest.DiceSum || latest.total || x1 + x2 + x3;
 
-        rikWS.on('error', (err) => {
-            console.error("WebSocket error:", err.message);
-            isAuthenticated = false;
-        });
+    const ketqua = getTaiXiu(sum);
+    const next = Number(session) + 1;
 
-        rikWS.on('pong', () => {
-            console.log("❤️ Received pong");
-        });
-
-    } catch (err) {
-        console.error("Failed to create WebSocket:", err.message);
-        reconnectTimeout = setTimeout(connectWebSocket, 5000);
-    }
-}
-
-// API endpoints
-fastify.register(require('@fastify/cors'));
-
-fastify.get("/api/taixiu/sunwin", async () => {
-    const valid = rikResults.filter(r => r.d1 !== undefined && r.d2 !== undefined && r.d3 !== undefined);
-    if (!valid.length) return { message: "Không có dữ liệu." };
-
-    const current = valid[0];
-    const sum = current.d1 + current.d2 + current.d3;
-    
-    return {
-        phien: current.sid,
-        xuc_xac_1: current.d1,
-        xuc_xac_2: current.d2,
-        xuc_xac_3: current.d3,
-        tong: sum,
-        ket_qua: sum >= 11 ? "Tài" : "Xỉu",
-        phien_hien_tai: rikCurrentSession || current.sid + 1,
-        status: isAuthenticated ? "connected" : "disconnected"
+    const tin_cay = {
+      TÀI: markov.predict === "TÀI" ? markov.confidence : "50%",
+      XỈU: markov.predict === "XỈU" ? markov.confidence : "50%"
     };
+
+    cache = {
+      admin: ADMIN,
+      phien: session,
+
+      xuc_xac_1: x1,
+      xuc_xac_2: x2,
+      xuc_xac_3: x3,
+
+      tong: sum,
+      ket_qua: ketqua,
+
+      phien_tiep_theo: next,
+
+      du_doan: markov.predict,
+      do_tin_cay: tin_cay,
+
+      danh_gia: evaluate(analysis.pattern, markov),
+
+      ly_do: `Markov | ${analysis.pattern.type} | Cầu ${analysis.pattern.streak}`,
+
+      pattern: analysis.pattern.type,
+
+      time: new Date().toLocaleString("vi-VN"),
+
+      original: data
+    };
+
+    return cache;
+
+  } catch (err) {
+    return cache || {
+      admin: ADMIN,
+      error: "API TẠM LỖI - ĐANG DÙNG CACHE",
+      time: new Date().toLocaleString("vi-VN")
+    };
+  }
+}
+
+// ===== ROUTES =====
+app.get("/", (req, res) => {
+  res.json({ status: "MA789 VIP RUNNING", admin: ADMIN });
 });
 
-fastify.get("/api/taixiu/history", async () => {
-    const valid = rikResults.filter(r => r.d1 !== undefined && r.d2 !== undefined && r.d3 !== undefined);
-    return valid.map(i => ({
-        phien: i.sid,
-        xuc_xac_1: i.d1,
-        xuc_xac_2: i.d2,
-        xuc_xac_3: i.d3,
-        tong: i.d1 + i.d2 + i.d3,
-        ket_qua: getTX(i.d1, i.d2, i.d3) === "T" ? "Tài" : "Xỉu"
-    }));
+app.get("/get", async (req, res) => {
+  res.json(await fetchData());
 });
 
-// Khởi động server
-const start = async () => {
-    try {
-        loadHistory();
-        connectWebSocket();
-        
-        await fastify.listen({ port: PORT, host: "0.0.0.0" });
-        console.log(`🚀 API chạy tại port ${PORT}`);
-    } catch (err) {
-        console.error("Server error:", err);
-        process.exit(1);
-    }
-};
+app.get("/taixiumd5", async (req, res) => {
+  res.json(await fetchData());
+});
 
-start();
+app.get("/predict", async (req, res) => {
+  res.json(await fetchData());
+});
+
+// ===== START =====
+app.listen(PORT, () => {
+  console.log("🔥 MA789 VIP RUNNING PORT " + PORT);
+});
